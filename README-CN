@@ -1,0 +1,127 @@
+Nginx LimitReq2
+限制请求速率模块， Nginx 本来有LimitReq模块， 淘宝的团队实现了 多关键词和跳转等功能， 我们在这个基础上添加了自动封锁功能
+
+用法
+
+官方支持的功能
+首先请阅读nginx 官方文档：
+
+Nginx LimitReq
+
+淘宝添加的功能
+然后接着阅读淘宝添加的功能， 我们目前只用到淘宝， 添加的白名单功能
+
+多变量支持
+跳转支持
+lication 下 多规则支持， 但多个规则使用的zone不能一样， 这点没有做检查。
+白名单支持
+具体文档：
+ngx_http_limit_req_module
+指令
+Syntax: limit_req_log_level info | notice | warn | error
+Default: limit_req_log_level warn
+Context: http
+
+和nginx相同。
+
+Syntax: limit_req_zone $session_variable1 $session_variable2 ... zone=name_of_zone:size rate=rate
+Default: -
+Context: http
+
+和nginx类似，不过支持多个变量，并且支持多个limit_req_zone的设置。比如：
+    limit_req_zone $binary_remote_addr zone=one:3m rate=1r/s;
+    limit_req_zone $binary_remote_addr $uri zone=two:3m rate=1r/s;
+    limit_req_zone $binary_remote_addr $uri $args zone=thre:3m rate=1r/s;
+
+上面的第二个指令表示当相同的ip地址并且访问相同的uri，会导致进入limit req的限制（每秒1个请求）。
+Syntax: limit_req [on | off] | zone=zone burst=burst [forbid_action=action] [nodelay]
+Default: -
+Context: http, server, location
+
+zone，burst以及nodelay的使用与nginx的limit req模块中相同。
+支持开关，默认是打开状态。并且一个location支持多个limit_req指令，当有多个limit_req指令的话，这些指令是或的关系，也就是当其中任意一个限制被触发，则执行对应的limit_req。
+forbid_action表示当条件被触发时，nginx所要执行的动作，支持name location和页面(/)，默认是返回503。比如：
+    limit_req_zone $binary_remote_addr zone=one:3m rate=1r/s;
+    limit_req_zone $binary_remote_addr $uri zone=two:3m rate=1r/s;
+    limit_req_zone $binary_remote_addr $uri $args zone=three:3m rate=1r/s;
+
+    location / {
+        limit_req zone=one burst=5;
+        limit_req zone=two forbid_action=@test1;
+        limit_req zone=three burst=3 forbid_action=@test2;
+    }
+
+    location /off {
+        limit_req off;
+    }
+
+    location @test1 {
+        rewrite ^ /test1.html;
+    }
+
+    location @test2 {
+        rewrite ^  /test2.html;
+    }
+Syntax: limit_req_whitelist geo_var_name=var_name geo_var_value=var_value
+Default: -
+Context: http, server, location
+表示白名单，要协同geo模块进行工作，其中geo_var_name表示geo模块设置的变量名，而geo_var_value表示geo模块设置的变量值。比如：
+    geo $white_ip {
+        ranges;
+        default 0;
+        127.0.0.1-127.0.0.255 1;
+    }
+
+    limit_req_whitelist geo_var_name=white_ip geo_var_value=1;
+上面表示ip 127.0.0.1-127.0.0.255这个区间都会跳过limit_req的处理。
+自动封锁功能
+自动封锁配置
+语法：
+
+limit_req2 zone=two block=连续多少次x每次观察时间间隔x封锁时间;
+limit_req2 zone=two block=5x60x1800; 表示观察到连续5分钟（60s）都有请求超过限制， 则封锁半个小时（1800s）。
+
+查询一个Key对应的请求是否被封锁， 以及封锁的时间
+limit_req2_block zone=two action=query $bip;
+action 表示动作， $bip 是对应的key， 这里不能使用变量 $binary_remote_addr, 因为这个变量如果我们请求的话， 就是我们自己的IP， 我们的期望结果应该不是这样子的， 呵呵。 这里一定要注意。
+
+这个$bip 是对应IP的二进制参数， 可以通过下面这个命令行获得一个IP地址的二进制表示方式
+
+ echo "127.0.0.1" | perl -nle 'printf("%%25%02X"x4 . "\n", split /\./)'
+然后通过请求
+
+http://..../limitreq2/two/query?bip=%257F%2500%2500%2501
+查询
+
+手动设置封锁功能
+limit_req2_block zone=two block_time=100 action=set $bip;
+清除封锁
+limit_req2_block zone=two action=clear $bip;
+一个完整的例子：
+       limit_req_zone $binary_remote_addr $uri zone=two:3m rate=1r/s;
+
+       location / {
+            limit_req2 zone=two block=5x60x1800;
+            echo ":$server_port:$uri";
+        }
+
+        location /limitreq2/two/query {
+            ## 两次 unescape， 因为如果只有一次， %00 无法通过URL传递过来
+            set_unescape_uri $bip $arg_bip;
+            set_unescape_uri $bip;
+            limit_req2_block zone=two action=query $bip;
+        }
+
+        location /limitreq2/two/block {
+            set_unescape_uri $bip $arg_bip;
+            set_unescape_uri $bip;
+            limit_req2_block zone=two block_time=100 action=set $bip;
+        }
+
+        location /limitreq2/two/clear {
+            set_unescape_uri $bip $arg_bip;
+            set_unescape_uri $bip;
+            limit_req2_block zone=two action=clear $bip;
+        }
+
+
