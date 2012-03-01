@@ -1,0 +1,40 @@
+Name
+    ngx-limit-req2
+
+Synopsis
+    limit_req2_zone $uri zone=one:3m rate=100r/m;
+    limit_req2_log_level error;
+
+    location / {
+        limit_req2 zone=one burst=10 block=3x3x20 nodelay;
+
+        root html;
+        index index.html;
+    }
+
+    ...
+
+
+    location /set {
+        limit_req2_block zone=one block_time=100 action=set $arg_u;
+    }
+
+    location /query {
+        limit_req2_block zone=one  action=query $arg_u;
+    }
+
+    location /clear {
+        limit_req2_block zone=one  action=clear $arg_u;
+    }
+
+
+Installation
+
+    ./configure --prefix=/opt/nginx \
+            --add-module=/path/to/ngx-limit-req2
+
+    make -j2
+    make install
+
+
+Thanks: Nginx Team && Tengine Team
