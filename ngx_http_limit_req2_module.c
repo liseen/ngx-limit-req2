@@ -24,6 +24,11 @@ typedef struct {
     uint64_t                     block_stat;
     ngx_uint_t                   block_stat_base;
     ngx_uint_t                   block_stop_time;
+
+    /* range count for computing qps */
+    ngx_uint_t                   last_seg;
+    ngx_uint_t                   curr_seg;
+
     u_char                       data[1];
 } ngx_http_limit_req2_node_t;
 
@@ -46,6 +51,13 @@ typedef struct {
     ngx_slab_pool_t             *shpool;
     /* integer value, 1 corresponds to 0.001 r/s */
     ngx_uint_t                   rate;
+
+
+    ngx_uint_t                   rate_seg;
+    ngx_uint_t                   last_seg;
+    ngx_uint_t                   curr_seg;
+    ngx_uint_t                   curr_seg_time_diff;
+
     ngx_array_t                 *limit_vars;
 } ngx_http_limit_req2_ctx_t;
 
@@ -60,6 +72,8 @@ typedef struct {
     ngx_uint_t                   block_stat_interval;
     ngx_uint_t                   block_stat_times;
     ngx_uint_t                   block_time;
+
+    ngx_uint_t                   rate_seg;
 } ngx_http_limit_req2_t;
 
 
@@ -79,14 +93,21 @@ typedef struct {
     ngx_int_t                    block_time;
     ngx_shm_zone_t              *block_shm_zone;
     ngx_array_t                 *block_limit_vars;
+
+    ngx_int_t                    enable_record_rate;
 } ngx_http_limit_req2_conf_t;
+
+
+static ngx_str_t   ngx_http_limit_req2_rate = ngx_string("limit_req2_rate");
 
 
 static void ngx_http_limit_req2_delay(ngx_http_request_t *r);
 static ngx_int_t ngx_http_limit_req2_lookup(ngx_http_request_t *r,
     ngx_shm_zone_t *shm_zone, ngx_array_t *limit_vars,
     ngx_http_limit_req2_t *limit_req2, ngx_uint_t hash,
-    ngx_uint_t *ep, ngx_uint_t *bst, ngx_int_t block_action);
+    ngx_uint_t *ep, ngx_uint_t *bst,
+    ngx_uint_t *last_seg, ngx_uint_t *curr_seg, ngx_uint_t *curr_seg_time_diff,
+    ngx_int_t block_action);
 static void ngx_http_limit_req2_expire(ngx_http_request_t *r,
     ngx_http_limit_req2_ctx_t *ctx, ngx_uint_t n);
 
@@ -103,13 +124,19 @@ static char *ngx_http_limit_req2_block(ngx_conf_t *cf, ngx_command_t *cmd,
     void *conf);
 static ngx_int_t ngx_http_limit_req2_init(ngx_conf_t *cf);
 
-static inline int get_stat_bit(uint64_t stat, int idx)
+
+static ngx_int_t ngx_http_limit_req2_add_variables(ngx_conf_t *cf);
+
+
+static inline
+int get_stat_bit(uint64_t stat, int idx)
 {
     stat >>= idx;
     return stat & 1;
 }
 
-static inline void set_stat_bit(uint64_t *pstat, int idx, int val)
+static inline
+void set_stat_bit(uint64_t *pstat, int idx, int val)
 {
     uint64_t tmp = val <<= idx;
     *pstat |= tmp;
@@ -168,14 +195,14 @@ static ngx_command_t  ngx_http_limit_req2_commands[] = {
 
 
 static ngx_http_module_t  ngx_http_limit_req2_module_ctx = {
-    NULL,                                  /* preconfiguration */
+    ngx_http_limit_req2_add_variables,      /* preconfiguration */
     ngx_http_limit_req2_init,               /* postconfiguration */
 
-    NULL,                                  /* create main configuration */
-    NULL,                                  /* init main configuration */
+    NULL,                                   /* create main configuration */
+    NULL,                                   /* init main configuration */
 
-    NULL,                                  /* create server configuration */
-    NULL,                                  /* merge server configuration */
+    NULL,                                   /* create server configuration */
+    NULL,                                   /* merge server configuration */
 
     ngx_http_limit_req2_create_conf,        /* create location configration */
     ngx_http_limit_req2_merge_conf          /* merge location configration */
@@ -294,11 +321,17 @@ ngx_http_limit_req2_handler(ngx_http_request_t *r)
     ngx_http_limit_req2_node_t     *lr;
     ngx_http_limit_req2_conf_t     *lrcf;
 
+    ngx_uint_t                     last_seg, curr_seg, curr_seg_time_diff;
+
     delay_excess = 0;
     delay_postion = 0;
     nodelay = 0;
     ctx = NULL;
     rc = 0;
+
+    last_seg = 0;
+    curr_seg = 0;
+    curr_seg_time_diff = 0;
 
     if (r->main->limit_req_set) {
         return NGX_DECLINED;
@@ -344,7 +377,9 @@ ngx_http_limit_req2_handler(ngx_http_request_t *r)
         excess = 0;
         rc = ngx_http_limit_req2_lookup(r,
                 limit_req2[i].shm_zone, ctx->limit_vars,
-                &limit_req2[i], hash, &excess, &block_stop_time, 0);
+                &limit_req2[i], hash, &excess, &block_stop_time,
+                &last_seg, &curr_seg, &curr_seg_time_diff,
+                0);
 
         ngx_log_debug6(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
                        "limit_req2 module: %i %ui.%03ui "
@@ -353,6 +388,25 @@ ngx_http_limit_req2_handler(ngx_http_request_t *r)
                        rc, excess / 1000, excess % 1000,
                        block_stop_time,
                        hash, total_len);
+
+        /*
+         * add variable for computing rate
+         */
+        if (limit_req2[i].rate_seg > 0) {
+
+            ctx->rate_seg = limit_req2[i].rate_seg;
+            ctx->last_seg = last_seg;
+            ctx->curr_seg = curr_seg;
+            ctx->curr_seg_time_diff = curr_seg_time_diff;
+
+            ngx_log_debug4(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+                "limit_req2 rate_seg : %ui "
+                "last_seg : %ui "
+                "curr_seg : %ui "
+                "curr_seg_time_diff : %ui",
+                limit_req2[i].rate_seg, last_seg, curr_seg, curr_seg_time_diff);
+
+        }
 
         /* first limit_req2 */
         if (rc == NGX_DECLINED) {
@@ -383,6 +437,9 @@ ngx_http_limit_req2_handler(ngx_http_request_t *r)
             lr->block_stat = 0;
             lr->block_stat_base = 0;
             lr->block_stop_time = 0;
+
+            lr->last_seg = 0;
+            lr->curr_seg = 1;
 
             ngx_http_limit_req2_copy_variables(r, &hash, ctx->limit_vars, lr);
 
@@ -565,7 +622,9 @@ ngx_http_limit_req2_lookup(ngx_http_request_t *r,
         ngx_shm_zone_t              *shm_zone,
         ngx_array_t                 *limit_vars,
         ngx_http_limit_req2_t *limit_req2, ngx_uint_t hash,
-        ngx_uint_t *ep, ngx_uint_t *bst, ngx_int_t block_action)
+        ngx_uint_t *ep, ngx_uint_t *bst,
+        ngx_uint_t *last_seg, ngx_uint_t *curr_seg, ngx_uint_t *curr_seg_time_diff,
+        ngx_int_t block_action)
 {
     u_char                          *lr_data, *lr_last;
     size_t                           lr_vv_len;
@@ -583,6 +642,9 @@ ngx_http_limit_req2_lookup(ngx_http_request_t *r,
     ngx_http_variable_value_t       *vv;
     ngx_http_limit_req2_variable_t  *lrv;
     ngx_http_limit_req2_conf_t      *lrcf;
+
+    ngx_msec_t                       last_rate_seg;
+    ngx_msec_t                       curr_rate_seg;
 
     ctx = shm_zone->data;
 
@@ -763,11 +825,41 @@ ngx_http_limit_req2_lookup(ngx_http_request_t *r,
                     return NGX_BUSY;
                 }
 
+                if (limit_req2->rate_seg != 0) {
+                    last_rate_seg = lr->last / limit_req2->rate_seg;
+                    curr_rate_seg = now / limit_req2->rate_seg;
+                    if (curr_rate_seg > last_rate_seg + 1) {
+
+                        lr->last_seg = 0;
+                        lr->curr_seg = 1;
+
+                    } else if (curr_rate_seg == last_rate_seg + 1) {
+
+                        lr->last_seg = lr->curr_seg;
+                        lr->curr_seg = 1;
+
+                    } else if (curr_rate_seg == last_rate_seg) {
+
+                        ++lr->curr_seg;
+
+                    } else {
+                        /* never appear */
+                        lr->last_seg = 0;
+                        lr->curr_seg = 0;
+                    }
+
+                    *last_seg = lr->last_seg;
+                    *curr_seg = lr->curr_seg;
+                    *curr_seg_time_diff = now % limit_req2->rate_seg;
+                }
+
                 lr->excess = excess;
                 lr->last = now;
 
+
                 if (excess) {
                     return NGX_AGAIN;
+
                 }
 
                 return NGX_OK;
@@ -780,6 +872,10 @@ ngx_http_limit_req2_lookup(ngx_http_request_t *r,
 
     *ep = 0;
 
+    *last_seg = 0;
+    *curr_seg = 1;
+    *curr_seg_time_diff = 0;
+
     return NGX_DECLINED;
 }
 
@@ -789,12 +885,13 @@ ngx_http_limit_req2_expire(ngx_http_request_t *r, ngx_http_limit_req2_ctx_t *ctx
     ngx_uint_t n)
 {
     ngx_int_t                   excess;
+    ngx_uint_t                  m;
     ngx_time_t                 *tp;
     ngx_msec_t                  now;
     ngx_queue_t                *q;
     ngx_msec_int_t              ms;
     ngx_rbtree_node_t          *node;
-    ngx_http_limit_req2_node_t  *lr;
+    ngx_http_limit_req2_node_t  *lr, *first_lr;
 
     tp = ngx_timeofday();
 
@@ -806,6 +903,9 @@ ngx_http_limit_req2_expire(ngx_http_request_t *r, ngx_http_limit_req2_ctx_t *ctx
      *        and one or two zero rate entries
      */
 
+    m = 0;
+    first_lr = NULL;
+
     while (n < 3) {
 
         if (ngx_queue_empty(&ctx->sh->queue)) {
@@ -816,13 +916,22 @@ ngx_http_limit_req2_expire(ngx_http_request_t *r, ngx_http_limit_req2_ctx_t *ctx
 
         lr = ngx_queue_data(q, ngx_http_limit_req2_node_t, queue);
 
+        if (lr->block_stop_time > (ngx_uint_t)tp->sec
+                && first_lr != lr && m++ < 100) {
+
+            ngx_queue_remove(&lr->queue);
+            ngx_queue_insert_head(&ctx->sh->queue, &lr->queue);
+
+            continue;
+        }
+
+        if (m == 1) {
+            first_lr = lr;
+        }
+
         if (n++ != 0) {
 
             ms = (ngx_msec_int_t) (now - lr->last);
-
-            if (lr->block_stop_time > (ngx_uint_t)tp->sec) {
-                return;
-            }
 
             ms = ngx_abs(ms);
             if (ms < 60000) {
@@ -942,6 +1051,8 @@ ngx_http_limit_req2_block_handler(ngx_http_request_t *r)
     ngx_buf_t                      *b;
     ngx_chain_t                    out;
 
+    ngx_uint_t                     last_seg, curr_seg, curr_seg_time_diff;
+
     lrcf = ngx_http_get_module_loc_conf(r, ngx_http_limit_req2_module);
 
     if (lrcf->block_action == 0) {
@@ -985,7 +1096,9 @@ ngx_http_limit_req2_block_handler(ngx_http_request_t *r)
         rc = ngx_http_limit_req2_lookup(r,
                 lrcf->block_shm_zone, lrcf->block_limit_vars,
                 NULL, hash, &excess,
-                &block_stop_time, block_action);
+                &block_stop_time,
+                &last_seg, &curr_seg, &curr_seg_time_diff,
+                block_action);
         ngx_shmtx_unlock(&ctx->shpool->mutex);
 
         if (rc == NGX_OK) {
@@ -1010,7 +1123,9 @@ ngx_http_limit_req2_block_handler(ngx_http_request_t *r)
         rc = ngx_http_limit_req2_lookup(r,
                 lrcf->block_shm_zone, lrcf->block_limit_vars,
                 NULL, hash, &excess,
-                &block_stop_time, block_action);
+                &block_stop_time,
+                &last_seg, &curr_seg, &curr_seg_time_diff,
+                block_action);
 
         if (rc == NGX_DECLINED) {
             n = offsetof(ngx_rbtree_node_t, color)
@@ -1083,7 +1198,9 @@ ngx_http_limit_req2_block_handler(ngx_http_request_t *r)
         rc = ngx_http_limit_req2_lookup(r,
                 lrcf->block_shm_zone, lrcf->block_limit_vars,
                 NULL, hash, &excess,
-                &block_stop_time, block_action);
+                &block_stop_time,
+                &last_seg, &curr_seg, &curr_seg_time_diff,
+                block_action);
         ngx_shmtx_unlock(&ctx->shpool->mutex);
 
         if (rc == NGX_OK) {
@@ -1166,6 +1283,8 @@ ngx_http_limit_req2_create_conf(ngx_conf_t *cf)
     conf->block_time = 1800;
     conf->block_shm_zone = NULL;
     conf->block_limit_vars = NULL;
+
+    conf->enable_record_rate = 0;
 
     return conf;
 }
@@ -1372,6 +1491,7 @@ ngx_http_limit_req2(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
     u_char                        *p1, *p2;
     ngx_uint_t                     i;
     ngx_http_limit_req2_t          *limit_req2;
+    ngx_uint_t                     rate_seg;
 
     if (lrcf->rules == NULL) {
         lrcf->rules = ngx_array_create(cf->pool, 5,
@@ -1396,6 +1516,7 @@ ngx_http_limit_req2(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
     }
 
     burst = 0;
+    rate_seg = 0;
 
     for (i = 1; i < cf->args->nelts; i++) {
 
@@ -1505,6 +1626,23 @@ ngx_http_limit_req2(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
             continue;
         }
 
+        if (ngx_strncmp(value[i].data, "rate_seg=", 9) == 0) {
+
+            rate_seg = ngx_atoi(value[i].data + 9, value[i].len - 9);
+
+            if (lrcf->enable_record_rate && rate_seg > 0) {
+                ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                                "duplicate rate_seg \"%V\" in limit_req2 config",
+                                &value[i]);
+
+                return NGX_CONF_ERROR;
+            }
+
+            lrcf->enable_record_rate = 1;
+
+            continue;
+        }
+
 
         if (ngx_strncmp(value[i].data, "nodelay", 7) == 0) {
             limit_req2->nodelay = 1;
@@ -1531,9 +1669,12 @@ ngx_http_limit_req2(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
     }
 
     limit_req2->burst = burst * 1000;
+    limit_req2->rate_seg = rate_seg;
+
     if (lrcf->enable == NGX_CONF_UNSET) {
         lrcf->enable = 1;
     }
+
 
     return NGX_CONF_OK;
 }
@@ -1732,6 +1873,93 @@ ngx_http_limit_req2_init(ngx_conf_t *cf)
     }
 
     *h = ngx_http_limit_req2_block_handler;
+
+    return NGX_OK;
+}
+
+static ngx_int_t
+ngx_http_limit_req2_rate_variable(ngx_http_request_t *r,
+    ngx_http_variable_value_t *v, uintptr_t data)
+{
+    ngx_http_limit_req2_ctx_t      *ctx;
+    ngx_http_limit_req2_conf_t     *lrcf;
+    ngx_http_limit_req2_t          *limit_req2;
+    ngx_uint_t                      i, rate;
+    ngx_buf_t                      *b;
+
+    lrcf = ngx_http_get_module_loc_conf(r, ngx_http_limit_req2_module);
+
+
+    lrcf = ngx_http_get_module_loc_conf(r, ngx_http_limit_req2_module);
+    if (lrcf->rules == NULL) {
+        v->not_found = 1;
+        return NGX_OK;
+    }
+
+    if (!lrcf->enable) {
+        v->not_found = 1;
+        return NGX_OK;
+    }
+
+
+    b = ngx_create_temp_buf(r->pool, 1024);
+    if (b == NULL) {
+        return NGX_ERROR;
+    }
+
+    limit_req2 = lrcf->rules->elts;
+    for (i = 0; i < lrcf->rules->nelts; i++) {
+        ctx = limit_req2[i].shm_zone->data;
+
+        if (ctx == NULL) {
+            return NGX_ERROR;
+        }
+
+        if (ctx->rate_seg > 0) {
+
+            rate = (ctx->last_seg + ctx->curr_seg) * 1000 * 1000 /
+                        (ctx->rate_seg + ctx->curr_seg_time_diff);
+
+            b->last = ngx_sprintf(b->last, "COUNT=%ui;SEG=%ui;QPS=%ui.%03ui",
+                        ctx->last_seg + ctx->curr_seg,
+                        ctx->rate_seg + ctx->curr_seg_time_diff,
+                        rate / 1000, rate % 1000);
+
+
+            v->len = b->last - b->pos;
+
+            v->data = ngx_pnalloc(r->pool, v->len);
+            if (v->data == NULL) {
+                return NGX_ERROR;
+            }
+
+            v->valid = 1;
+            v->no_cacheable = 0;
+            v->not_found = 0;
+
+            ngx_memcpy(v->data, b->pos, v->len);
+
+            return NGX_OK;
+        }
+    }
+
+    v->not_found = 1;
+    return NGX_OK;
+}
+
+
+static ngx_int_t
+ngx_http_limit_req2_add_variables(ngx_conf_t *cf)
+{
+    ngx_http_variable_t  *var;
+
+    var = ngx_http_add_variable(cf, &ngx_http_limit_req2_rate, 0);
+    if (var == NULL) {
+        return NGX_ERROR;
+    }
+
+
+    var->get_handler = ngx_http_limit_req2_rate_variable;
 
     return NGX_OK;
 }
